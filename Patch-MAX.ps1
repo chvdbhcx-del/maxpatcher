@@ -12,8 +12,12 @@
   Where to put the patched copy. Default: .\MAX_patched next to this script. Must not exist or be empty.
 
 .NOTES
-  Only built-in PowerShell 5.1 / .NET. Run the result with Start_MAX_patched.cmd:
-  it sets QML_DISABLE_DISK_CACHE=1, without it Qt uses the QML precompiled into max.exe
+  Only built-in PowerShell 5.1 / .NET.
+  Also patches the crashpad pipe name in both tracernative.dll (needed to run Max in an AppContainer)
+  and copies Launch-MAX-Isolated.ps1, Start_MAX_isolated.cmd, Probe_MAX_isolated.cmd, Remove-MAX-Isolated.ps1
+  (they must lie next to this script) into the copy.
+  Start the copy with Start_MAX_isolated.cmd (isolated, recommended) or Start_MAX_patched.cmd (not isolated).
+  Both set QML_DISABLE_DISK_CACHE=1: without it Qt uses the QML precompiled into max.exe
   and the patched QML sources are ignored.
 #>
 [CmdletBinding()]
@@ -260,20 +264,64 @@ foreach ($exe in ($patches | ForEach-Object { $_.Exe } | Select-Object -Unique))
     $results += [MaxPatcher]::Apply($path, $set, [ref]$changed)
 }
 
-# ---------------------------------------------------------------- launcher
+# ---------------------------------------------------------------- crashpad pipe name in tracernative.dll
+# Max's crash reporter (crashpad inside tracernative.dll) creates \\.\pipe\crashpad_<pid>_<rand>.
+# Inside an AppContainer only \\.\pipe\LOCAL\... may be created, otherwise crashpad aborts Max (0x80000003).
+# Same-length replacement of the name template; crashpad_handler.exe gets the name from the client.
+function Patch-PipeName([int]$id, [string]$rel) {
+    $old = '\\.\pipe\crashpad_%lu_'; $new = '\\.\pipe\LOCAL\cp_%lu_'
+    $r = [pscustomobject]@{ Id = $id; Name = "crashpad pipe name in $rel"; Exe = $rel; Status = ''; Detail = '' }
+    $p = Join-Path $Dest $rel
+    if (-not (Test-Path -LiteralPath $p)) { $r.Status = 'NOT FOUND'; $r.Detail = "$rel missing"; return $r }
+    $L1 = [Text.Encoding]::GetEncoding(28591)
+    $b = [IO.File]::ReadAllBytes($p); $t = $L1.GetString($b)
+    $find = { param($s) $list = @(); $i = 0; while (($i = $t.IndexOf($s, $i, [StringComparison]::Ordinal)) -ge 0) { $list += $i; $i++ }; ,$list }
+    $o = & $find $old; $n = & $find $new
+    if ($o.Count -eq 0 -and $n.Count -ge 1) { $r.Status = 'ALREADY PATCHED'; $r.Detail = ('template already {0} at 0x{1:X}' -f $new, $n[0]); return $r }
+    if ($o.Count -ne 1) { $r.Status = $(if ($o.Count -eq 0) { 'NOT FOUND' } else { 'FAILED' }); $r.Detail = "template '$old' found $($o.Count)x (expected 1), file not changed"; return $r }
+    $at = $o[0]
+    if ($b[$at + $old.Length] -ne 0) { $r.Status = 'FAILED'; $r.Detail = ('no NUL terminator after template at 0x{0:X}, file not changed' -f $at); return $r }
+    $bak = "$p.orig"; if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $p -Destination $bak }
+    $nb = $L1.GetBytes($new); [Array]::Copy($nb, 0, $b, $at, $nb.Length)
+    [IO.File]::WriteAllBytes($p, $b)
+    $chk = [IO.File]::ReadAllBytes($p)
+    if ($L1.GetString($chk, $at, $new.Length) -ne $new -or $chk.Length -ne $b.Length) {
+        Copy-Item -LiteralPath $bak -Destination $p -Force; $r.Status = 'FAILED'; $r.Detail = 'verification failed, restored from .orig'; return $r
+    }
+    $r.Status = 'APPLIED'; $r.Detail = ('0x{0:X}: {1} -> {2} (same length, backup {3}.orig)' -f $at, $old, $new, (Split-Path $rel -Leaf))
+    return $r
+}
+Write-Host "Patching tracernative.dll ..."
+$results += Patch-PipeName 9  'tracernative.dll'
+$results += Patch-PipeName 10 'max-service\tracernative.dll'
+
+# ---------------------------------------------------------------- launchers
 $cmd = "@echo off`r`nrem Without this variable Qt uses the QML precompiled into max.exe and ignores the patched QML sources.`r`nset QML_DISABLE_DISK_CACHE=1`r`nstart `"`" `"%~dp0max.exe`" %*`r`n"
 [IO.File]::WriteAllText((Join-Path $Dest 'Start_MAX_patched.cmd'), $cmd, [Text.Encoding]::ASCII)
 
+$support = 'Launch-MAX-Isolated.ps1', 'Start_MAX_isolated.cmd', 'Probe_MAX_isolated.cmd', 'Remove-MAX-Isolated.ps1'
+$missing = @($support | Where-Object { -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $_)) })
+$lr = [pscustomobject]@{ Id = 11; Name = 'AppContainer launch scripts copied'; Exe = '-'; Status = ''; Detail = '' }
+if ($missing.Count -gt 0) { $lr.Status = 'NOT FOUND'; $lr.Detail = "missing next to Patch-MAX.ps1: $($missing -join ', ')" }
+else {
+    foreach ($s in $support) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $s) -Destination (Join-Path $Dest $s) -Force }
+    $lr.Status = 'APPLIED'; $lr.Detail = ($support -join ', ')
+}
+$results += $lr
+
 # ---------------------------------------------------------------- report
+$total = 11
 Write-Host ""
 Write-Host "=== Result ==="
 $results | Sort-Object Id | Format-Table Id, Status, Name -AutoSize | Out-String -Width 200 | Write-Host
 $results | Sort-Object Id | ForEach-Object { Write-Host ("[{0}] {1}: {2}" -f $_.Id, $_.Status, $_.Detail) }
 $ok = @($results | Where-Object { $_.Status -in 'APPLIED', 'ALREADY PATCHED' }).Count
 Write-Host ""
-Write-Host "$ok of $($patches.Count) patches in place. Patched copy: $Dest"
-Write-Host "Run it ONLY via: $(Join-Path $Dest 'Start_MAX_patched.cmd')"
-foreach ($f in 'max.exe', 'max-service\max-service.exe', 'Start_MAX_patched.cmd') {
+Write-Host "$ok of $total steps in place. Patched copy: $Dest"
+Write-Host "Start Max isolated (quit the normal Max first, also from the tray): $(Join-Path $Dest 'Start_MAX_isolated.cmd')"
+Write-Host "Diagnostics: $(Join-Path $Dest 'Probe_MAX_isolated.cmd'), log: $(Join-Path $Dest 'launch.log')"
+foreach ($f in 'max.exe', 'max-service\max-service.exe', 'tracernative.dll', 'max-service\tracernative.dll') {
     $fp = Join-Path $Dest $f; if (Test-Path -LiteralPath $fp) { Write-Host ("SHA256 {0}  {1}" -f (Get-FileHash -LiteralPath $fp).Hash, $f) }
 }
-if ($ok -lt $patches.Count) { exit 2 }
+if ($ok -lt $total) { exit 2 }
+exit 0
